@@ -192,6 +192,38 @@ database.ref('config_precios').on('value', (snapshot) => {
     }
 });
 
+// --- SINCRONIZACIÓN EN TIEMPO REAL DE CUENTAS/PEDIDOS ---
+let ultimaSincronizacion = JSON.stringify({});
+database.ref('paolos_cuentas_activas').on('value', (snapshot) => {
+    const data = snapshot.val() || {};
+    const datosStringificados = JSON.stringify(data);
+    
+    // Solo actualizar si el cambio viene de otro dispositivo
+    if (datosStringificados !== ultimaSincronizacion && datosStringificados !== JSON.stringify(Cuentas)) {
+        console.log("🔄 Cuentas actualizado desde otro dispositivo");
+        Cuentas = JSON.parse(datosStringificados);
+        guardarEstadoLocal();
+        
+        // Refrescar la interfaz si estamos en la vista de mesas
+        if (document.getElementById('product-list-container')) {
+            const modTitle = document.getElementById('module-title').innerText;
+            // Encontrar el destino actual del módulo
+            for (let dest of Object.keys(Cuentas)) {
+                if (modTitle.toUpperCase() === dest.toUpperCase()) {
+                    renderOrderSummary(dest);
+                    break;
+                }
+            }
+        }
+    }
+    ultimaSincronizacion = datosStringificados;
+});
+
+function syncCuentasToFirebase() {
+    database.ref('paolos_cuentas_activas').set(Cuentas)
+        .catch(error => console.error("Error sincronizando cuentas:", error));
+}
+
 function syncInv() { database.ref('bebidas_inv').set(DB.bebidas_inv); }
 function syncPrecios() {
     database.ref('config_precios').set({ menu: DB.menu, sabores: DB.sabores_pizzas });
@@ -245,14 +277,16 @@ function renderVentasDia(container) {
         if(v.metodo === 'Efectivo') totalEfectivo += v.total;
         else { totalTransf += v.total; totalesDetalle.transferencia += v.total; }
         v.items.forEach(item => {
-            const n = item.nombre.toLowerCase();
-            if (n.includes("porción")) totalesDetalle.porciones += item.precio;
-            else if (n.includes("pizza")) totalesDetalle.pizzas += item.precio;
-            else if (n.includes("crepe")) totalesDetalle.crepes += item.precio;
-            else if (n.includes("lasaña")) totalesDetalle.lasañas += item.precio;
-            else if (n.includes("pasta")) totalesDetalle.pastas += item.precio;
-            else if (n.includes("panzerotti")) totalesDetalle.panzerotti += item.precio;
-            else totalesDetalle.bebidas += item.precio;
+            // Usar el campo 'categoria' guardado en cada item (igual que en prepararCierre)
+            const cat = item.categoria || "otros";
+            if (cat === "porciones") totalesDetalle.porciones += item.precio;
+            else if (cat === "pizzas") totalesDetalle.pizzas += item.precio;
+            else if (cat === "crepes") totalesDetalle.crepes += item.precio;
+            else if (cat === "lasañas") totalesDetalle.lasañas += item.precio;
+            else if (cat === "pastas") totalesDetalle.pastas += item.precio;
+            else if (cat === "panzerottis") totalesDetalle.panzerotti += item.precio;
+            else if (cat === "bebidas") totalesDetalle.bebidas += item.precio;
+            // Si no tiene categoría asignada, se ignora (no suma a nada)
         });
     });
 
@@ -301,14 +335,16 @@ function prepararCierre(ventas, gastos) {
     VentasHistoricas.forEach(v => {
         if(v.metodo === 'Transferencia') desglose.transferencia += v.total;
         v.items.forEach(item => {
-            const n = item.nombre.toLowerCase();
-            if (n.includes("porción")) desglose.porciones += item.precio;
-            else if (n.includes("pizza")) desglose.pizzas += item.precio;
-            else if (n.includes("crepe")) desglose.crepes += item.precio;
-            else if (n.includes("lasaña")) desglose.lasañas += item.precio;
-            else if (n.includes("pasta")) desglose.pastas += item.precio;
-            else if (n.includes("panzerotti")) desglose.panzerotti += item.precio;
-            else desglose.bebidas += item.precio;
+            // Usar el campo 'categoria' guardado en cada item
+            const cat = item.categoria || "otros";
+            if (cat === "porciones") desglose.porciones += item.precio;
+            else if (cat === "pizzas") desglose.pizzas += item.precio;
+            else if (cat === "crepes") desglose.crepes += item.precio;
+            else if (cat === "lasañas") desglose.lasañas += item.precio;
+            else if (cat === "pastas") desglose.pastas += item.precio;
+            else if (cat === "panzerottis") desglose.panzerotti += item.precio;
+            else if (cat === "bebidas") desglose.bebidas += item.precio;
+            // Si no tiene categoría asignada, se ignora (no suma a nada)
         });
     });
 
@@ -329,6 +365,9 @@ function prepararCierre(ventas, gastos) {
             VentasHistoricas = []; Gastos = []; Cuentas = {}; cajaAbierta = false;
             CajaActual = { base: 0, fecha: null, horaApertura: null };
     
+            // Sincronizar cuentas vacías para limpiar en todos los dispositivos
+            database.ref('paolos_cuentas_activas').set({});
+            
             // Limpieza de disco:
             localStorage.removeItem('paolos_caja_abierta');
             localStorage.removeItem('paolos_caja_datos');
@@ -484,22 +523,24 @@ function filterItems(dest) {
                 
                 // Caso especial Lasañas (3 tamaños)
                 if (catKey === 'lasañas') {
+                    const nombreEscapado = p.nombre.replace(/'/g, "\\'");
                     html += `
                     <div class="product-card search-result">
                         <small style="color: var(--accent); font-size: 0.6rem;">🍝 LASAÑA</small>
                         <h4>${p.nombre}</h4>
                         <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:5px; margin-top: 10px;">
-                            <button class="category-btn" onclick="addItemToOrder('${dest}', '${p.nombre} (P)', ${p.precio_p})">P</button>
-                            <button class="category-btn" onclick="addItemToOrder('${dest}', '${p.nombre} (M)', ${p.precio_m})">M</button>
-                            <button class="category-btn" onclick="addItemToOrder('${dest}', '${p.nombre} (F)', ${p.precio_f})">F</button>
+                            <button class="category-btn" onclick="addItemToOrder('${dest}', '${nombreEscapado} (P)', ${p.precio_p})">P</button>
+                            <button class="category-btn" onclick="addItemToOrder('${dest}', '${nombreEscapado} (M)', ${p.precio_m})">M</button>
+                            <button class="category-btn" onclick="addItemToOrder('${dest}', '${nombreEscapado} (F)', ${p.precio_f})">F</button>
                         </div>
                     </div>`;
                 } 
                 // Resto de productos (Pizzas completas, etc.)
                 else {
+                    const nombreEscapado = p.nombre.replace(/'/g, "\\'");
                     const action = (catKey === 'pizzas_completa') ? 
-                        `onclick="renderPizzaFlavorSelector('${dest}', '${p.nombre}', ${p.precio})"` : 
-                        `onclick="addItemToOrder('${dest}', '${p.nombre}', ${p.precio})"`;
+                        `onclick="renderPizzaFlavorSelector('${dest}', '${nombreEscapado}', ${p.precio})"` : 
+                        `onclick="addItemToOrder('${dest}', '${nombreEscapado}', ${p.precio})"`;
                     
                     html += `
                     <div class="product-card search-result">
@@ -564,43 +605,48 @@ function renderProductsByCategory(cat, dest) {
 
             // 🍝 LASAÑAS (con tamaños)
             else if (cat === 'lasañas') {
+                const nombreEscapado = p.nombre.replace(/'/g, "\\'");
                 html += `<div class="product-card">
                     <h4>${p.nombre}</h4>
                     <div style="display:grid; gap:5px;">
-                        <button class="category-btn" onclick="addItemToOrder('${dest}', '${p.nombre} (P)', ${p.precio_p})">P: $${p.precio_p}</button>
-                        <button class="category-btn" onclick="addItemToOrder('${dest}', '${p.nombre} (M)', ${p.precio_m})">M: $${p.precio_m}</button>
-                        <button class="category-btn" onclick="addItemToOrder('${dest}', '${p.nombre} (F)', ${p.precio_f})">F: $${p.precio_f}</button>
+                        <button class="category-btn" onclick="addItemToOrder('${dest}', '${nombreEscapado} (P)', ${p.precio_p}, 'lasañas')">P: $${p.precio_p}</button>
+                        <button class="category-btn" onclick="addItemToOrder('${dest}', '${nombreEscapado} (M)', ${p.precio_m}, 'lasañas')">M: $${p.precio_m}</button>
+                        <button class="category-btn" onclick="addItemToOrder('${dest}', '${nombreEscapado} (F)', ${p.precio_f}, 'lasañas')">F: $${p.precio_f}</button>
                     </div>
                 </div>`;
             }
 
-            // 🍽️ PASTAS (precio normal)
-            else if (cat === 'pastas') {
-                html += `<div class="product-card">
-                    <h4>${p.nombre}</h4>
-                    <span class="price">$${p.precio.toLocaleString()}</span>
-                    <button class="btn-action" onclick="addItemToOrder('${dest}', '${p.nombre}', ${p.precio})">
-                        AÑADIR
-                    </button>
-                </div>`;
-            }
+           // --- DENTRO DE renderProductsByCategory(cat, dest) ---
 
-            // 🍔 PANZEROTTIS (precio normal)
-            else if (cat === 'panzerottis') {
-                html += `<div class="product-card">
-                    <h4>${p.nombre}</h4>
-                    <span class="price">$${p.precio.toLocaleString()}</span>
-                    <button class="btn-action" onclick="addItemToOrder('${dest}', '${p.nombre}', ${p.precio})">
-                        AÑADIR
-                    </button>
-                </div>`;
-            }
+// 🍽️ PASTAS (precio normal)
+else if (cat === 'pastas') {
+    const nombreEscapado = p.nombre.replace(/'/g, "\\'");
+    html += `<div class="product-card">
+        <h4>${p.nombre}</h4>
+        <span class="price">$${p.precio.toLocaleString()}</span>
+        <button class="btn-action" onclick="addItemToOrder('${dest}', '${nombreEscapado}', ${p.precio}, 'pastas')">
+            AÑADIR
+        </button>
+    </div>`;
+}
 
-            // 🔥 OTROS PRODUCTOS
+// 🍔 PANZEROTTIS (precio normal)
+else if (cat === 'panzerottis') {
+    html += `<div class="product-card">
+        <h4>${p.nombre}</h4>
+        <span class="price">$${p.precio.toLocaleString()}</span>
+        <button class="btn-action" onclick="addItemToOrder('${dest}', '${p.nombre}', ${p.precio}, 'panzerottis')">
+            AÑADIR
+        </button>
+    </div>`;
+}
+
+            // 🔥 OTROS PRODUCTOS (Crepes, etc.)
             else {
+                const nombreEscapado = p.nombre.replace(/'/g, "\\'");
                 html += `<div class="product-card">
                     <h4>${p.nombre}</h4>
-                    <button class="btn-action" onclick="addItemToOrder('${dest}', '${p.nombre}', ${p.precio})">
+                    <button class="btn-action" onclick="addItemToOrder('${dest}', '${nombreEscapado}', ${p.precio}, '${cat}')">
                         AÑADIR
                     </button>
                 </div>`;
@@ -614,18 +660,22 @@ function renderProductsByCategory(cat, dest) {
 // --- SABORES Y PORCIONES ---
 function renderPizzaFlavorSelector(dest, pizzaN, precio) {
     const container = document.getElementById('product-list-container');
+    const nombreEscapado = pizzaN.replace(/'/g, "\\'");
     let html = `<div class="flavor-selection-box"><h4 class="accent">${pizzaN}</h4><div class="flavor-list">`;
     DB.sabores_pizzas.forEach(s => {
         html += `<div class="flavor-item-check"><input type="checkbox" id="ps-${s.id}" value="${s.nombre}" class="pizza-flavor-cb"><label for="ps-${s.id}">${s.nombre}</label></div>`;
     });
-    html += `</div><button class="btn-action" onclick="confirmarPizzaCompleta('${dest}', '${pizzaN}', ${precio})">CONFIRMAR SABORES</button></div>`;
+    html += `</div><button class="btn-action" onclick="confirmarPizzaCompleta('${dest}', '${nombreEscapado}', ${precio})">CONFIRMAR SABORES</button></div>`;
     container.innerHTML = html;
 }
 
 function confirmarPizzaCompleta(dest, pizzaN, precio) {
     const sel = Array.from(document.querySelectorAll('.pizza-flavor-cb:checked')).map(cb => cb.value);
-    if (sel.length === 0 || sel.length > 2) { alert("Elige 1 o 2 sabores."); return; }
-    addItemToOrder(dest, `${pizzaN} (${sel.join("/")})`, precio);
+    if (sel.length === 0 || sel.length > 2) { 
+        alert("Elige 1 o 2 sabores."); 
+        return; 
+    }
+    addItemToOrder(dest, `${pizzaN} (${sel.join("/")})`, precio, 'pizzas');
 }
 
 function renderFlavorSelector(container, dest) {
@@ -646,7 +696,7 @@ function updateFlavorQty(id, d) {
 function savePortions(dest) {
     DB.sabores_pizzas.forEach(s => {
         const v = parseInt(document.getElementById(`f-${s.id}`).innerText);
-        for(let i=0; i<v; i++) addItemToOrder(dest, `Porción ${s.nombre}`, s.precio);
+        for(let i=0; i<v; i++) addItemToOrder(dest, `Porción ${s.nombre}`, s.precio, 'porciones');
         document.getElementById(`f-${s.id}`).innerText = 0;
     });
 }
@@ -693,37 +743,41 @@ function clearOrder(dest) {
             items: [...items] 
         });
         guardarEstadoLocal();
-        Cuentas[dest] = []; metodoPagoSeleccionado = 'Efectivo'; openModule('pizzas'); 
+        Cuentas[dest] = []; 
+        syncCuentasToFirebase(); // Sincronizar cambio de borrado inmediatamente
+        metodoPagoSeleccionado = 'Efectivo'; 
+        openModule('pizzas'); 
     } 
 }
 
 function addItemToOrder(dest, nombre, precio, categoria = "otros") {
-
-    if (!ordenes[dest]) {
-        ordenes[dest] = {
-            pizzas: [],
-            bebidas: [],
-            otros: []
-        };
+    // 1. Validar que exista la mesa/destino en el objeto Cuentas
+    if (!Cuentas[dest]) {
+        Cuentas[dest] = [];
     }
 
-    const item = { nombre, precio };
+    // 2. Agregar el producto con su categoría para los reportes
+    Cuentas[dest].push({
+        nombre: nombre,
+        precio: precio,
+        categoria: categoria 
+    });
 
-    if (categoria === "bebidas") {
-        ordenes[dest].bebidas.push(item);
-    } 
-    else if (categoria === "pizzas") {
-        ordenes[dest].pizzas.push(item);
-    } 
-    else {
-        ordenes[dest].otros.push(item);
-    }
+    // 3. Guardar cambios en el almacenamiento local
+    guardarEstadoLocal();
+    
+    // 4. Sincronizar con Firebase en tiempo real
+    syncCuentasToFirebase();
 
-    renderOrden(dest);
+    // 5. Refrescar la interfaz
+    renderOrderSummary(dest);
+    
+    console.log(`Añadido: ${nombre} (${categoria}) a ${dest}`);
 }
-
 function removeItem(dest, index) { 
-    Cuentas[dest].splice(index, 1); 
+    Cuentas[dest].splice(index, 1);
+    guardarEstadoLocal();
+    syncCuentasToFirebase();
     renderOrderSummary(dest); 
 }
 
@@ -738,7 +792,10 @@ function abrirCaja() {
             horaApertura: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
            
         };
-         guardarEstadoLocal();
+        guardarEstadoLocal();
+        // Sincronizar cuentas vacías al abrir (para limpiar datos anteriores en todos los dispositivos)
+        Cuentas = {};
+        syncCuentasToFirebase();
         renderVentasDia(document.getElementById('module-content'));
     }
 }
@@ -748,7 +805,7 @@ function sellBebida(dest, pId) {
     if (item && item.cantidad > 0) {
         item.cantidad--; 
         syncInv();
-        addItemToOrder(dest, item.nombre, item.precio || 0);
+        addItemToOrder(dest, item.nombre, item.precio || 0, 'bebidas');
         renderProductsByCategory('bebidas', dest);
     }
 }

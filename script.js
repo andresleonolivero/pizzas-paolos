@@ -61,28 +61,46 @@ function mostrarError() {
 
 // --- 4. ARRANQUE DEL SISTEMA CORREGIDO ---
 window.addEventListener('load', () => {
-    // 1. Escuchamos los cambios de Firebase PRIMERO
+    // 1. Sincronización de Usuarios y Sesión
     database.ref('users').on('value', (snapshot) => {
         listaUsuariosLocal = snapshot.val();
-        
         const status = document.getElementById('debug-status');
         if (status) {
             status.innerText = "SISTEMA CONECTADO ✅";
             status.style.color = "#0f0";
         }
-
-        // 2. SOLO después de recibir los datos de Firebase, verificamos la sesión
         const sesion = localStorage.getItem('token_paolos');
-        if (sesion && listaUsuariosLocal) {
-            // Verificamos que el usuario de la sesión aún exista en la DB
-            if (listaUsuariosLocal[sesion.toLowerCase()]) {
-                entrarAlSistema(sesion);
-            }
+        if (sesion && listaUsuariosLocal && listaUsuariosLocal[sesion.toLowerCase()]) {
+            entrarAlSistema(sesion);
         }
     });
 
-    // Opcional: Solo llama a inicializarAdmin si realmente necesitas resetear el usuario ventas
-    // inicializarAdmin(); 
+    // 2. Sincronización de GASTOS en tiempo real
+    database.ref('paolos_gastos_actuales').on('value', (snapshot) => {
+        const data = snapshot.val();
+        Gastos = data ? Object.keys(data).map(key => ({ idFirebase: key, ...data[key] })) : [];
+        localStorage.setItem('paolos_gastos_turno', JSON.stringify(Gastos));
+        
+        // Refrescar UI si el usuario está en el módulo de gastos o caja
+        if (document.getElementById('work-area') && !document.getElementById('work-area').classList.contains('hidden')) {
+            const title = document.getElementById('module-title').innerText;
+            if (title === "OTROS / GASTOS") renderOtros(document.getElementById('module-content'));
+            if (title === "CONTROL DE CAJA (TURNO)") renderVentasDia(document.getElementById('module-content'));
+        }
+    });
+
+    // 3. Sincronización de VENTAS/TRANSFERENCIAS en tiempo real
+    database.ref('paolos_ventas_actuales').on('value', (snapshot) => {
+        const data = snapshot.val();
+        VentasHistoricas = data ? Object.values(data) : [];
+        localStorage.setItem('paolos_ventas_turno', JSON.stringify(VentasHistoricas));
+        
+        if (document.getElementById('work-area') && !document.getElementById('work-area').classList.contains('hidden')) {
+            const title = document.getElementById('module-title').innerText;
+            if (title === "REPORTES TRANSFERENCIAS") renderTransferencias(document.getElementById('module-content'));
+            if (title === "CONTROL DE CAJA (TURNO)") renderVentasDia(document.getElementById('module-content'));
+        }
+    });
 });
 
 function cerrarSesion() {
@@ -332,10 +350,10 @@ function prepararCierre(ventas, gastos) {
     if (!confirm(`¿Sincronizar y cerrar caja?\nNeto: $${(ventas - gastos).toLocaleString()}`)) return;
 
     let desglose = { porciones: 0, pizzas: 0, crepes: 0, lasañas: 0, pastas: 0, panzerotti: 0, bebidas: 0, transferencia: 0 };
+    
     VentasHistoricas.forEach(v => {
         if(v.metodo === 'Transferencia') desglose.transferencia += v.total;
         v.items.forEach(item => {
-            // Usar el campo 'categoria' guardado en cada item
             const cat = item.categoria || "otros";
             if (cat === "porciones") desglose.porciones += item.precio;
             else if (cat === "pizzas") desglose.pizzas += item.precio;
@@ -344,7 +362,6 @@ function prepararCierre(ventas, gastos) {
             else if (cat === "pastas") desglose.pastas += item.precio;
             else if (cat === "panzerottis") desglose.panzerotti += item.precio;
             else if (cat === "bebidas") desglose.bebidas += item.precio;
-            // Si no tiene categoría asignada, se ignora (no suma a nada)
         });
     });
 
@@ -358,21 +375,32 @@ function prepararCierre(ventas, gastos) {
         timestamp: firebase.database.ServerValue.TIMESTAMP
     };
 
+    // 1. Guardar el resumen en el historial permanente
     database.ref('paolos_historial').push(nuevoCierre)
-        .then(() => alert("✅ Sincronizado en la nube"))
-        .catch((error) => alert("❌ Error nube: " + error.message))
+        .then(() => {
+            alert("✅ Caja cerrada y sincronizada en la nube");
+        })
+        .catch((error) => {
+            alert("❌ Error al sincronizar: " + error.message);
+        })
         .finally(() => {
-            VentasHistoricas = []; Gastos = []; Cuentas = {}; cajaAbierta = false;
+            // 2. LIMPIEZA EN FIREBASE (Para que todos los dispositivos se pongan en cero)
+            database.ref('paolos_cuentas_activas').set({});
+            database.ref('paolos_ventas_actuales').remove();
+            database.ref('paolos_gastos_actuales').remove();
+
+            // 3. LIMPIEZA LOCAL
+            VentasHistoricas = []; 
+            Gastos = []; 
+            Cuentas = {}; 
+            cajaAbierta = false;
             CajaActual = { base: 0, fecha: null, horaApertura: null };
     
-            // Sincronizar cuentas vacías para limpiar en todos los dispositivos
-            database.ref('paolos_cuentas_activas').set({});
-            
-            // Limpieza de disco:
             localStorage.removeItem('paolos_caja_abierta');
             localStorage.removeItem('paolos_caja_datos');
             localStorage.removeItem('paolos_ventas_turno');
             localStorage.removeItem('paolos_gastos_turno');
+            
             showMenu();
         });
 }
@@ -737,14 +765,19 @@ function clearOrder(dest) {
     const total = items.reduce((s, i) => s + i.precio, 0);
     if (total === 0) return;
     if (confirm(`¿Finalizar ${dest}?`)) { 
-        VentasHistoricas.push({ 
-            destino: dest, total, metodo: metodoPagoSeleccionado, 
+        const nuevaVenta = { 
+            destino: dest, 
+            total: total, 
+            metodo: metodoPagoSeleccionado, 
             hora: new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}), 
             items: [...items] 
-        });
-        guardarEstadoLocal();
+        };
+
+        // Sincronizar venta en la nube
+        database.ref('paolos_ventas_actuales').push(nuevaVenta);
+
         Cuentas[dest] = []; 
-        syncCuentasToFirebase(); // Sincronizar cambio de borrado inmediatamente
+        syncCuentasToFirebase(); 
         metodoPagoSeleccionado = 'Efectivo'; 
         openModule('pizzas'); 
     } 
@@ -870,17 +903,39 @@ function addToInventory(t) {
 // --- OTROS GASTOS ---
 function renderOtros(container) {
     let total = Gastos.reduce((sum, g) => sum + g.monto, 0);
-    let html = `<div class="inventory-form glass-card"><input type="text" id="g-d" placeholder="Gasto"><input type="number" id="g-m" placeholder="$"><button class="btn-nav" onclick="agregarGasto()">+</button></div><div class="inv-total">TOTAL: $${total.toLocaleString()}</div><table>`;
-     Gastos.forEach((g, i) => html += `<tr><td>${g.descripcion}</td><td>$${g.monto.toLocaleString()}</td><td><button class="btn-del" onclick="eliminarGasto(${i})">🗑️</button></td></tr>`);
+    let html = `
+        <div class="inventory-form glass-card">
+            <input type="text" id="g-d" placeholder="Descripción del gasto">
+            <input type="number" id="g-m" placeholder="Monto $">
+            <button class="btn-nav" onclick="agregarGasto()">+</button>
+        </div>
+        <div class="inv-total">TOTAL GASTOS: $${total.toLocaleString()}</div>
+        <table>`;
+    
+    Gastos.forEach((g) => {
+        html += `
+            <tr>
+                <td>${g.descripcion}</td>
+                <td>$${g.monto.toLocaleString()}</td>
+                <td><button class="btn-del" onclick="eliminarGasto('${g.idFirebase}')">🗑️</button></td>
+            </tr>`;
+    });
     container.innerHTML = html + `</table>`;
 }
 function agregarGasto() { 
     const d = document.getElementById('g-d').value, m = parseInt(document.getElementById('g-m').value); 
-    if(d && m > 0) { Gastos.push({descripcion:d, monto:m}); renderOtros(document.getElementById('module-content')); }
-    guardarEstadoLocal();
+    if(d && m > 0) { 
+        database.ref('paolos_gastos_actuales').push({ descripcion: d, monto: m });
+        document.getElementById('g-d').value = "";
+        document.getElementById('g-m').value = "";
+    }
 }
-function eliminarGasto(i) { Gastos.splice(i,1); renderOtros(document.getElementById('module-content')); guardarEstadoLocal(); }
-
+// --- MODIFICADO: Elimina gasto de Firebase usando su ID ---
+function eliminarGasto(idFirebase) { 
+    if(confirm("¿Eliminar este gasto?")) {
+        database.ref(`paolos_gastos_actuales/${idFirebase}`).remove();
+    }
+}
 // --- REPORTES ---
 function renderTransferencias(container) {
     const transf = VentasHistoricas.filter(v => v.metodo === 'Transferencia');
